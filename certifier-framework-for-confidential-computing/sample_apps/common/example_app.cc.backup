@@ -28,23 +28,12 @@
 #include <openssl/hmac.h>
 #include <openssl/err.h>
 
-#include <fstream>      // For std::ifstream and std::ofstream
-#include <stdexcept>    // For std::exception
-#include <cstdlib>      // For system()
-#include <string>
-#include <exception>
-
 #include "certifier_framework.h"
 #include "certifier_utilities.h"
 #include "certifier_algorithms.h"
 
-#include "bioinformatics.pb.h"
-#include <google/protobuf/text_format.h>
-
 using namespace certifier::framework;
 using namespace certifier::utilities;
-using certifier::bioinformatics::BioinformaticsRequest;
-using certifier::bioinformatics::BioinformaticsResponse;
 
 // Ops are: cold-init, get-certified, run-app-as-client, run-app-as-server
 DEFINE_bool(print_all, false, "verbose");
@@ -73,90 +62,6 @@ DEFINE_string(auth_symmetric_key_alg,
               "authenticated symmetric key algorithm");
 
 static string enclave_type("simulated-enclave");
-
-// Helper function to read file contents
-std::string read_file_contents(const std::string& file_path) {
-    std::ifstream file(file_path, std::ios::binary);
-    if (!file.is_open()) {
-        return "";
-    }
-    return std::string((std::istreambuf_iterator<char>(file)), 
-                      std::istreambuf_iterator<char>());
-}
-
-certifier::bioinformatics::BioinformaticsResponse process_bioinformatics_request(
-    const certifier::bioinformatics::BioinformaticsRequest& request) {
-    
-    certifier::bioinformatics::BioinformaticsResponse response;
-    
-    try {
-        // Create temp directory
-        mkdir("/tmp/bio_data", 0777);
-        mkdir("/tmp/results", 0777);
-        
-        // Clone repository
-        string command = "git clone " + request.repository_url() + " /tmp/bio_data 2>&1";
-        FILE* pipe = popen(command.c_str(), "r");
-        if (!pipe) {
-            response.set_success(false);
-            response.set_error("Failed to execute git clone");
-            return response;
-        }
-        
-        char buffer[128];
-        string result;
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            result += buffer;
-        }
-        int ret = pclose(pipe);
-        
-        if (ret != 0) {
-            response.set_success(false);
-            response.set_error("Git clone failed: " + result);
-            return response;
-        }
-        
-        // Process based on analysis type
-        if (request.analysis_type() == "sequence_quality") {
-            string input_file = "/tmp/bio_data/" + request.dataset_name();
-            command = "fastqc " + input_file + " " + request.parameters() + " -o /tmp/results 2>&1";
-            pipe = popen(command.c_str(), "r");
-            result.clear();
-            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                result += buffer;
-            }
-            ret = pclose(pipe);
-            
-            if (ret == 0) {
-                string html_result = read_file_contents("/tmp/results/" + 
-                    request.dataset_name().substr(0, request.dataset_name().find('.')) + 
-                    "_fastqc.html");
-                if (!html_result.empty()) {
-                    response.set_result(html_result);
-                    response.set_success(true);
-                    response.set_status("Analysis completed successfully");
-                } else {
-                    response.set_success(false);
-                    response.set_error("No results generated");
-                }
-            } else {
-                response.set_success(false);
-                response.set_error("FastQC failed: " + result);
-            }
-        } else {
-            response.set_success(false);
-            response.set_error("Unsupported analysis type: " + request.analysis_type());
-        }
-    } catch (const std::exception& e) {
-        response.set_success(false);
-        response.set_error(std::string("Exception: ") + e.what());
-    }
-    
-    // Clean up
-    int ret = system("rm -rf /tmp/bio_data /tmp/results");
-    (void)ret;  // Explicitly ignore return value
-    return response;
-}
 
 // Parameters for simulated enclave
 bool get_enclave_parameters(string **s, int *n) {
@@ -327,92 +232,54 @@ cc_trust_manager *trust_mgr = nullptr;
 // -----------------------------------------------------------------------------------------
 
 bool client_application(secure_authenticated_channel &channel) {
-    printf("Client peer id is %s\n", channel.peer_id_.c_str());
 
-    // Create request
-    certifier::bioinformatics::BioinformaticsRequest request;
-    request.set_analysis_type("sequence_quality");
-    request.set_repository_url("https://github.com/galaxyproject/galaxy-test-data.git");
-    request.set_dataset_name("2.fastq");
-    request.set_parameters("--quiet --threads 2");
+  printf("Client peer id is %s\n", channel.peer_id_.c_str());
+#ifdef DEBUG
+  if (channel.peer_cert_ != nullptr) {
+    printf("Client peer cert is:\n");
+    X509_print_fp(stdout, channel.peer_cert_);
+  }
+#endif  // DEBUG
 
-    // Serialize and send
-    string serialized_request;
-    if (!request.SerializeToString(&serialized_request)) {
-        printf("Failed to serialize request\n");
-        return false;
-    }
-    channel.write(serialized_request.size(), (byte *)serialized_request.c_str());
+  // client sends a message over authenticated, encrypted channel
+  const char *msg = "Hi from your secret client\n";
+  channel.write(strlen(msg), (byte *)msg);
 
-    // Get response
-    string out;
-    int n = channel.read(&out);
-    if (n <= 0) {
-        printf("No response from server\n");
-        return false;
-    }
+  // Get server response over authenticated, encrypted channel and print it
+  string out;
+  int    n = channel.read(&out);
+  printf("SSL client read: %s\n", out.data());
+  channel.close();
 
-    // Parse response
-    certifier::bioinformatics::BioinformaticsResponse response;
-    if (!response.ParseFromString(out)) {
-        printf("Failed to parse response\n");
-        return false;
-    }
-
-    printf("\nAnalysis Results:\n");
-    printf("Success: %s\n", response.success() ? "true" : "false");
-    printf("Status: %s\n", response.status().c_str());
-    if (!response.error().empty()) {
-        printf("Error: %s\n", response.error().c_str());
-    }
-    
-    // Save results to file
-    if (response.success() && !response.result().empty()) {
-        std::ofstream outfile("analysis_results.html", std::ios::binary);
-        if (outfile.is_open()) {
-            outfile << response.result();
-            outfile.close();
-            printf("Results saved to analysis_results.html\n");
-        } else {
-            printf("Failed to save results\n");
-        }
-    }
-
-    channel.close();
-    return response.success();
+  if (n < 0 || strcmp(out.c_str(), "Hi from your secret server\n") != 0) {
+    printf("%s() error, line %d, did not receive expected server response\n",
+           __func__,
+           __LINE__);
+    return false;
+  }
+  return true;
 }
 
+
 void server_application(secure_authenticated_channel &channel) {
-    printf("Server peer id is %s\n", channel.peer_id_.c_str());
 
-    // Receive request
-    string request_str;
-    int n = channel.read(&request_str);
-    if (n <= 0) {
-        printf("No request received\n");
-        return;
-    }
+  printf("Server peer id is %s\n", channel.peer_id_.c_str());
+#ifdef DEBUG
+  if (channel.peer_cert_ != nullptr) {
+    printf("Server peer cert is:\n");
+    X509_print_fp(stdout, channel.peer_cert_);
+  }
+#endif  // DEBUG
 
-    certifier::bioinformatics::BioinformaticsRequest request;
-    if (!request.ParseFromString(request_str)) {
-        printf("Failed to parse request\n");
-        return;
-    }
+  // Read message from client over authenticated, encrypted channel
+  string out;
+  int    n = channel.read(&out);
+  printf("SSL server read: %s\n", (const char *)out.data());
 
-    printf("Received request for analysis: %s\n", request.analysis_type().c_str());
-    printf("Dataset: %s\n", request.dataset_name().c_str());
-
-    // Process request
-    certifier::bioinformatics::BioinformaticsResponse response = process_bioinformatics_request(request);
-
-    // Send response
-    string response_str;
-    if (!response.SerializeToString(&response_str)) {
-        printf("Failed to serialize response\n");
-        return;
-    }
-    channel.write(response_str.size(), (byte *)response_str.c_str());
-    channel.close();
+  // Reply over authenticated, encrypted channel
+  const char *msg = "Hi from your secret server\n";
+  channel.write(strlen(msg), (byte *)msg);
+  channel.close();
 }
 
 int main(int an, char **av) {
