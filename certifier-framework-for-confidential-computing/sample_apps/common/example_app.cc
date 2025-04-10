@@ -28,12 +28,23 @@
 #include <openssl/hmac.h>
 #include <openssl/err.h>
 
+#include <fstream>      // For std::ifstream and std::ofstream
+#include <stdexcept>    // For std::exception
+#include <cstdlib>      // For system()
+#include <string>
+#include <exception>
+
 #include "certifier_framework.h"
 #include "certifier_utilities.h"
 #include "certifier_algorithms.h"
 
+// #include "bioinformatics.pb.h"
+// #include <google/protobuf/text_format.h>
+
 using namespace certifier::framework;
 using namespace certifier::utilities;
+// using certifier::bioinformatics::BioinformaticsRequest;
+// using certifier::bioinformatics::BioinformaticsResponse;
 
 // Ops are: cold-init, get-certified, run-app-as-client, run-app-as-server
 DEFINE_bool(print_all, false, "verbose");
@@ -61,7 +72,80 @@ DEFINE_string(auth_symmetric_key_alg,
               Enc_method_aes_256_cbc_hmac_sha256,
               "authenticated symmetric key algorithm");
 
+DEFINE_string(analysis_type, "sequence_quality", "Type of analysis to perform");
+DEFINE_string(repository_url, "", "URL of data repository");
+DEFINE_string(dataset_name, "example.fastq", "Name of dataset to analyze");
+DEFINE_string(parameters, "--quiet --threads 2", "Analysis parameters");
+
 static string enclave_type("simulated-enclave");
+
+// Helper function to read file contents
+std::string read_file_contents(const std::string& file_path) {
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file.is_open()) {
+        return "";
+    }
+    return std::string((std::istreambuf_iterator<char>(file)), 
+                      std::istreambuf_iterator<char>());
+}
+
+bool perform_bioinformatics_analysis(const string& analysis_type,
+                                   const string& input_file,
+                                   const string& parameters,
+                                   string* result_output,
+                                   string* error_msg) {
+    try {
+        // Create unique temp directory for results
+        string work_dir = "/tmp/bio_fasta";
+        mkdir(work_dir.c_str(), 0777);
+        
+        string command;
+        if (analysis_type == "sequence_quality") {
+            command = "fastqc " + input_file + " " + parameters + " -o " + work_dir + " 2>&1";
+        } else {
+            *error_msg = "Unsupported analysis type: " + analysis_type;
+            return false;
+        }
+
+        printf("Executing: %s\n", command.c_str());
+        
+        // Execute and show real-time output
+        FILE* pipe = popen(command.c_str(), "r");
+        if (!pipe) {
+            *error_msg = "Failed to execute analysis command";
+            return false;
+        }
+
+        char buffer[128];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            printf("%s", buffer);  // Print output in real-time
+        }
+        
+        int ret = pclose(pipe);
+        if (ret != 0) {
+            *error_msg = "Analysis failed with exit code " + std::to_string(ret);
+            return false;
+        }
+
+        // Get results file path
+        string output_file = work_dir + "/" + 
+                          input_file.substr(input_file.find_last_of("/\\") + 1) + 
+                          "_fastqc.html";
+                          
+        *result_output = read_file_contents(output_file);
+        // if (result_output->empty()) {
+        //     *error_msg = "No results generated in " + output_file;
+        //     return false;
+        // }
+
+        printf("\nResults saved to: %s\n", output_file.c_str());
+        return true;
+    } catch (const std::exception& e) {
+        *error_msg = string("Exception: ") + e.what();
+        return false;
+    }
+}
+
 
 // Parameters for simulated enclave
 bool get_enclave_parameters(string **s, int *n) {
@@ -232,45 +316,72 @@ cc_trust_manager *trust_mgr = nullptr;
 // -----------------------------------------------------------------------------------------
 
 bool client_application(secure_authenticated_channel &channel) {
+    printf("Client peer id is %s\n", channel.peer_id_.c_str());
 
-  printf("Client peer id is %s\n", channel.peer_id_.c_str());
-#ifdef DEBUG
-  if (channel.peer_cert_ != nullptr) {
-    printf("Client peer cert is:\n");
-    X509_print_fp(stdout, channel.peer_cert_);
-  }
-#endif  // DEBUG
+    // Initial handshake with server
+    const char *msg = "Hi from your secret client\n";
+    channel.write(strlen(msg), (byte *)msg);
 
-  // client sends a message over authenticated, encrypted channel
-  const char *msg = "Hi from your secret client\n";
-  channel.write(strlen(msg), (byte *)msg);
+    string out;
+    channel.read(&out);
+    printf("Server response: %s\n", out.data());
+    channel.close();  // Close channel after handshake
 
-  // Get server response over authenticated, encrypted channel and print it
-  string out;
-  int    n = channel.read(&out);
-  printf("SSL client read: %s\n", out.data());
-  channel.close();
+    printf("\n=== Starting Bioinformatics Analysis ===\n");
+    printf("Analysis type: %s\n", FLAGS_analysis_type.c_str());
+    printf("Dataset: %s\n", FLAGS_dataset_name.c_str());
 
-  if (n < 0 || strcmp(out.c_str(), "Hi from your secret server\n") != 0) {
-    printf("%s() error, line %d, did not receive expected server response\n",
-           __func__,
-           __LINE__);
-    return false;
-  }
-  return true;
+    string result;
+    string error;
+    bool success = false;
+    string input_path;
+
+    try {
+        // Setup working directory
+        string work_dir = "/tmp/bio_fasta";
+        
+        if (!FLAGS_repository_url.empty()) {
+            printf("Cloning repository...\n");
+            string cmd = "git clone " + FLAGS_repository_url + " " + work_dir + "/repo 2>&1";
+            if (system(cmd.c_str()) != 0) {
+                throw std::runtime_error("Git clone failed");
+            }
+            input_path = work_dir + "/repo/" + FLAGS_dataset_name;
+        } else {
+            input_path = FLAGS_data_dir + FLAGS_dataset_name;
+        }
+
+        // Run analysis
+        success = perform_bioinformatics_analysis(
+            FLAGS_analysis_type,
+            input_path,
+            FLAGS_parameters,
+            &result,
+            &error);
+
+        if (success) {
+            printf("\n=== ANALYSIS COMPLETE ===\n");
+            printf("First 200 characters of results:\n%.200s...\n", result.c_str());
+        } else {
+            printf("\n=== ANALYSIS FAILED ===\n%s\n", error.c_str());
+        }
+
+    } catch (const std::exception& e) {
+        printf("\nERROR: %s\n", e.what());
+        success = false;
+    }
+
+    // Cleanup
+    string cleanup_cmd = "rm -rf /tmp/bio_fasta/repo";
+    int cleanup_status = system(cleanup_cmd.c_str());
+    if (cleanup_status != 0) {
+        printf("Warning: Cleanup command failed (status %d)\n", cleanup_status);
+    }
+
+    return success;
 }
-
-
 void server_application(secure_authenticated_channel &channel) {
-
-  printf("Server peer id is %s\n", channel.peer_id_.c_str());
-#ifdef DEBUG
-  if (channel.peer_cert_ != nullptr) {
-    printf("Server peer cert is:\n");
-    X509_print_fp(stdout, channel.peer_cert_);
-  }
-#endif  // DEBUG
-
+    printf("Server peer id is %s\n", channel.peer_id_.c_str());
   // Read message from client over authenticated, encrypted channel
   string out;
   int    n = channel.read(&out);
@@ -279,8 +390,9 @@ void server_application(secure_authenticated_channel &channel) {
   // Reply over authenticated, encrypted channel
   const char *msg = "Hi from your secret server\n";
   channel.write(strlen(msg), (byte *)msg);
-  channel.close();
+//   channel.close();
 }
+
 
 int main(int an, char **av) {
   string usage("Simple App");

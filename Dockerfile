@@ -47,3 +47,14 @@ WORKDIR /root/certifier-framework-for-confidential-computing
 
 # Entry point script
 ENTRYPOINT ["/root/entrypoint.sh"]
+
+
+# "gatk --java-options \"-Xmx4G\" HaplotypeCaller " + "-R reference.fasta " +"-I " + input_file + " " +"-O " + results_dir + "/" + base_name + "_indels.vcf " +parameters + " 2>&1";
+
+# wget https://github.com/broadinstitute/gatk/releases/download/4.2.0.0/gatk-4.2.0.0.zip
+# unzip gatk-4.2.0.0.zip
+# cd gatk-4.2.0.0
+# java -jar gatk-package-4.2.0.0-local.jar --version
+# echo 'export PATH=$PATH:/path/to/gatk-4.2.0.0' >> ~/.bashrc
+# source ~/.bashrc
+# apt-get install samtools
